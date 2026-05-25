@@ -1,6 +1,6 @@
 # Redmine Workflow Skill
 
-基于 `red-cli` + `jojogithook` API + 钉钉文档 MCP 的完整需求开发工作流自动化工具。
+基于 `red-cli` + `githook` API + 钉钉文档 MCP 的完整需求开发工作流自动化工具。
 
 ## 功能特性
 
