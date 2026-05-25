@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+#
+# red-branch — 基于 red-cli + jojogithook API 的需求分支创建工作流
+#
+# 用法:
+#   red-branch <需求号>                     # 交互模式：选择 GitLab 项目并创建分支
+#   red-branch <需求号> --project <项目名>   # 指定 GitLab 项目名，跳过选择
+#   red-branch <需求号> --list              # 只列出可用项目，不创建分支
+#   red-branch <需求号> --dry-run           # 只显示将要执行的操作，不实际创建
+#   red-branch <需求号> --local-only        # 只创建本地 git 分支，不推送远程
+#   red-branch --help                       # 显示帮助
+#
+# 功能:
+#   1. 通过 red-cli 查询 Redmine 需求详情
+#   2. 通过 jojogithook API 获取用户关联的 GitLab 项目
+#   3. 在 GitLab 上创建远程分支 feature/<username>/<issue_id>
+#   4. 在本地 git 创建并切换到对应分支
+#   5. 拉取远程分支与本地同步
+#
+# 依赖:
+#   - red-cli (brew install red-cli)
+#   - curl, jq
+#   - git
+#
+
+set -euo pipefail
+
+# ─── 配置 ───────────────────────────────────────────────────────────────────
+JOJOGITHOOK_BASE="https://your-githook-domain.com/api/v1"
+JOJOGITHOOK_TOKEN=$(jq -r '.githook-token' "$HOME/.red/config.json" 2>/dev/null || echo "")
+REDMINE_BASE="https://your-redmine-domain.com"
+
+if [[ -z "$API_KEY" || "$API_KEY" == "null" ]]; then
+  echo -e "${RED}[ERROR]${NC} red-cli 配置中缺少 api-key"
+  exit 1
+fi
+if [[ -z "$JOJOGITHOOK_TOKEN" || "$JOJOGITHOOK_TOKEN" == "null" ]]; then
+  echo -e "${RED}[ERROR]${NC} 未找到 jojogithook-token，请在 ~/.red/config.json 中添加 \"jojogithook-token\" 字段"
+  exit 1
+fi
+
+# ─── 颜色定义 ───────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# ─── 帮助信息 ───────────────────────────────────────────────────────────────
+show_help() {
+  cat << 'EOF'
+red-branch — 基于 red-cli + jojogithook API 的需求分支创建工作流
+
+用法:
+  red-branch <需求号>                     交互模式：选择 GitLab 项目并创建分支
+  red-branch <需求号> --project <项目名>   指定 GitLab 项目名，跳过选择
+  red-branch <需求号> --list              只列出可用项目，不创建分支
+  red-branch <需求号> --dry-run           只显示将要执行的操作，不实际创建
+  red-branch <需求号> --local-only        只创建本地 git 分支，不推送远程
+  red-branch --help                       显示帮助信息
+
+功能:
+  1. 通过 red-cli 查询 Redmine 需求详情
+  2. 通过 jojogithook API 获取用户关联的 GitLab 项目
+  3. 在 GitLab 上创建远程分支 feature/<username>/<issue_id>
+  4. 在本地 git 创建并切换到对应分支
+  5. 拉取远程分支与本地同步
+
+示例:
+  red-branch 526205                  # 交互式选择项目并创建分支
+  red-branch 526205 --project edu-ae # 直接在 edu-ae 项目上创建分支
+  red-branch 526205 --list           # 查看需求号关联的项目列表
+  red-branch 526205 --dry-run        # 预览操作但不执行
+
+EOF
+  exit 0
+}
+
+# ─── 工具函数 ───────────────────────────────────────────────────────────────
+log_info()    { echo -e "${BLUE}[INFO]${NC}  $1"; }
+log_success() { echo -e "${GREEN}[OK]${NC}    $1"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step()    { echo -e "${BOLD}${CYAN}==>${NC} $1"; }
+
+# ─── 参数解析 ───────────────────────────────────────────────────────────────
+ISSUE_ID=""
+SPECIFIED_PROJECT=""
+MODE="interactive"  # interactive | list | dry-run | local-only
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)
+      show_help
+      ;;
+    --project|-p)
+      SPECIFIED_PROJECT="$2"
+      shift 2
+      ;;
+    --list|-l)
+      MODE="list"
+      shift
+      ;;
+    --dry-run|-d)
+      MODE="dry-run"
+      shift
+      ;;
+    --local-only)
+      MODE="local-only"
+      shift
+      ;;
+    -*)
+      log_error "未知选项: $1"
+      show_help
+      ;;
+    *)
+      if [[ -z "$ISSUE_ID" ]]; then
+        ISSUE_ID="$1"
+      else
+        log_error "需求号已指定为 $ISSUE_ID，多余参数: $1"
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$ISSUE_ID" ]]; then
+  log_error "请提供需求号"
+  echo ""
+  show_help
+fi
+
+# ─── Step 1: 获取 Redmine 需求信息 ────────────────────────────────────────────
+log_step "查询 Redmine 需求 #${ISSUE_ID}"
+
+# 读取 red-cli 配置获取 API key 和 server
+RED_CONFIG_FILE="$HOME/.red/config.json"
+if [[ ! -f "$RED_CONFIG_FILE" ]]; then
+  log_error "未找到 red-cli 配置文件: $RED_CONFIG_FILE"
+  log_info "请先运行: red-cli auth login"
+  exit 1
+fi
+
+API_KEY=$(jq -r '."api-key"' "$RED_CONFIG_FILE")
+SERVER=$(jq -r '.server' "$RED_CONFIG_FILE")
+
+if [[ -z "$API_KEY" || "$API_KEY" == "null" ]]; then
+  log_error "red-cli 配置中缺少 API key"
+  exit 1
+fi
+
+# 查询需求详情
+ISSUE_JSON=$(curl -s -H "X-Redmine-API-Key: $API_KEY" "${SERVER}/issues/${ISSUE_ID}.json")
+
+if [[ -z "$ISSUE_JSON" ]] || echo "$ISSUE_JSON" | jq -e '.error' >/dev/null 2>&1; then
+  log_error "查询需求 #${ISSUE_ID} 失败"
+  echo "$ISSUE_JSON" | jq . 2>/dev/null || echo "$ISSUE_JSON"
+  exit 1
+fi
+
+# 提取需求信息
+PROJECT_ID=$(echo "$ISSUE_JSON" | jq -r '.issue.project.id')
+PROJECT_NAME=$(echo "$ISSUE_JSON" | jq -r '.issue.project.name')
+ISSUE_SUBJECT=$(echo "$ISSUE_JSON" | jq -r '.issue.subject')
+TRACKER_NAME=$(echo "$ISSUE_JSON" | jq -r '.issue.tracker.name')
+ISSUE_STATUS=$(echo "$ISSUE_JSON" | jq -r '.issue.status.name')
+
+log_success "需求信息:"
+echo -e "  ${BOLD}标题:${NC}      ${ISSUE_SUBJECT}"
+echo -e "  ${BOLD}项目:${NC}      ${PROJECT_NAME} (ID: ${PROJECT_ID})"
+echo -e "  ${BOLD}类型:${NC}      ${TRACKER_NAME}"
+echo -e "  ${BOLD}状态:${NC}      ${ISSUE_STATUS}"
+echo -e "  ${BOLD}链接:${NC}      ${SERVER}/issues/${ISSUE_ID}"
+
+# ─── Step 2: 获取用户名 ────────────────────────────────────────────────────────
+log_step "获取当前用户信息"
+
+# 从 red-cli 配置获取 user-id
+USER_ID=$(jq -r '."user-id"' "$RED_CONFIG_FILE")
+
+# 通过 API 获取 login 名
+USER_LOGIN=$(curl -s -H "X-Redmine-API-Key: $API_KEY" "${SERVER}/users/${USER_ID}.json" | jq -r '.user.login')
+
+# 同时检查 git 用户名作为 fallback
+GIT_USERNAME=$(git config user.name 2>/dev/null || echo "")
+
+if [[ -z "$USER_LOGIN" || "$USER_LOGIN" == "null" ]]; then
+  if [[ -n "$GIT_USERNAME" ]]; then
+    USER_LOGIN="$GIT_USERNAME"
+    log_warn "无法从 Redmine 获取用户名，使用 git 用户名: ${USER_LOGIN}"
+  else
+    log_error "无法获取用户名"
+    exit 1
+  fi
+fi
+
+log_success "用户: ${USER_LOGIN}"
+
+# ─── Step 3: 获取 Redmine 项目 identifier ────────────────────────────────────────
+log_step "获取 Redmine 项目 identifier"
+
+PROJECT_IDENTIFIER=$(curl -s -H "X-Redmine-API-Key: $API_KEY" "${SERVER}/projects/${PROJECT_ID}.json" | jq -r '.project.identifier')
+
+if [[ -z "$PROJECT_IDENTIFIER" || "$PROJECT_IDENTIFIER" == "null" ]]; then
+  log_error "无法获取项目 identifier"
+  exit 1
+fi
+
+log_success "项目 identifier: ${PROJECT_IDENTIFIER}"
+
+# ─── Step 4: 获取用户关联的 GitLab 项目 ────────────────────────────────────────
+log_step "查询用户关联的 GitLab 项目"
+
+GITLAB_PROJECTS=$(curl -s -H "token: ${JOJOGITHOOK_TOKEN}" \
+  "${JOJOGITHOOK_BASE}/getuserproject?username=${USER_LOGIN}&identifier=${PROJECT_IDENTIFIER}")
+
+PROJECT_COUNT=$(echo "$GITLAB_PROJECTS" | jq '.total')
+
+if [[ "$PROJECT_COUNT" == "0" || "$PROJECT_COUNT" == "null" ]]; then
+  log_error "没有找到关联的 GitLab 项目"
+  log_info "请确认需求 #${ISSUE_ID} 所属项目 ${PROJECT_NAME} 是否在 GitLab 上有对应仓库"
+  exit 1
+fi
+
+log_success "找到 ${PROJECT_COUNT} 个关联 GitLab 项目"
+
+# ─── 构建分支名 ────────────────────────────────────────────────────────────────
+BRANCH_NAME="feature/${USER_LOGIN}/${ISSUE_ID}"
+
+# ─── --list 模式 ────────────────────────────────────────────────────────────────
+if [[ "$MODE" == "list" ]]; then
+  echo ""
+  echo -e "${BOLD}可用 GitLab 项目:${NC}"
+  echo "$GITLAB_PROJECTS" | jq -r '.projects[] | "  [\(.id)] \(.name)  →  https://your-gitlab-domain.com/\(.path_with_namespace)  (\(.description))"'
+  echo ""
+  echo -e "${BOLD}将创建的分支:${NC}  ${BRANCH_NAME}"
+  echo ""
+  exit 0
+fi
+
+# ─── Step 5: 选择 GitLab 项目 ────────────────────────────────────────────────
+log_step "选择 GitLab 项目"
+
+if [[ -n "$SPECIFIED_PROJECT" ]]; then
+  # 用户指定了项目名
+  SELECTED_PROJECT=$(echo "$GITLAB_PROJECTS" | jq -r --arg name "$SPECIFIED_PROJECT" '.projects[] | select(.name == $name) | .id')
+  SELECTED_PATH=$(echo "$GITLAB_PROJECTS" | jq -r --arg name "$SPECIFIED_PROJECT" '.projects[] | select(.name == $name) | .path_with_namespace')
+  SELECTED_DESC=$(echo "$GITLAB_PROJECTS" | jq -r --arg name "$SPECIFIED_PROJECT" '.projects[] | select(.name == $name) | .description')
+
+  if [[ -z "$SELECTED_PROJECT" || "$SELECTED_PROJECT" == "null" ]]; then
+    log_error "项目名 '${SPECIFIED_PROJECT}' 不在关联项目列表中"
+    log_info "可用的项目名:"
+    echo "$GITLAB_PROJECTS" | jq -r '.projects[] | "  \(.name)"'
+    exit 1
+  fi
+  log_success "已指定项目: ${SPECIFIED_PROJECT} (GitLab ID: ${SELECTED_PROJECT})"
+else
+  # 交互式选择或自动选择第一个
+  if [[ "$MODE" == "dry-run" || "$MODE" == "list" ]]; then
+    # dry-run/list 模式自动选择第一个项目
+    SELECTED_PROJECT=$(echo "$GITLAB_PROJECTS" | jq -r '.projects[0].id')
+    SELECTED_PATH=$(echo "$GITLAB_PROJECTS" | jq -r '.projects[0].path_with_namespace')
+    SELECTED_DESC=$(echo "$GITLAB_PROJECTS" | jq -r '.projects[0].description')
+    SELECTED_NAME=$(echo "$GITLAB_PROJECTS" | jq -r '.projects[0].name')
+    log_success "自动选择项目: ${SELECTED_NAME} (GitLab ID: ${SELECTED_PROJECT})"
+  else
+    echo ""
+    echo -e "${BOLD}请选择 GitLab 项目:${NC}"
+    echo ""
+    PROJECTS_ARRAY=$(echo "$GITLAB_PROJECTS" | jq -r '.projects[] | "[\(.id)] \(.name) — \(.description)"')
+
+    i=1
+    declare -a PROJECT_IDS
+    declare -a PROJECT_PATHS
+    declare -a PROJECT_NAMES
+
+    while IFS= read -r line; do
+      pid=$(echo "$GITLAB_PROJECTS" | jq -r ".projects[$((i-1))].id")
+      ppath=$(echo "$GITLAB_PROJECTS" | jq -r ".projects[$((i-1))].path_with_namespace")
+      pname=$(echo "$GITLAB_PROJECTS" | jq -r ".projects[$((i-1))].name")
+      echo -e "  ${BOLD}${i})${NC} ${line}"
+      PROJECT_IDS[$i]=$pid
+      PROJECT_PATHS[$i]=$ppath
+      PROJECT_NAMES[$i]=$pname
+      i=$((i+1))
+    done <<< "$PROJECTS_ARRAY"
+
+    echo ""
+    read -rp "请输入序号 [1]: " CHOICE
+
+    if [[ -z "$CHOICE" ]]; then
+      CHOICE=1
+    fi
+
+    if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [[ "$CHOICE" -lt 1 ]] || [[ "$CHOICE" -gt "${PROJECT_COUNT}" ]]; then
+      log_error "无效的选择: ${CHOICE}"
+      exit 1
+    fi
+
+    SELECTED_PROJECT=${PROJECT_IDS[$CHOICE]}
+    SELECTED_PATH=${PROJECT_PATHS[$CHOICE]}
+    SELECTED_DESC=""
+
+    log_success "已选择项目: ${PROJECT_NAMES[$CHOICE]} (GitLab ID: ${SELECTED_PROJECT})"
+  fi
+fi
+
+echo ""
+echo -e "${BOLD}操作摘要:${NC}"
+echo -e "  ${BOLD}需求:${NC}      #${ISSUE_ID} — ${ISSUE_SUBJECT}"
+echo -e "  ${BOLD}项目:${NC}      ${PROJECT_NAME}"
+echo -e "  ${BOLD}GitLab:${NC}    https://your-gitlab-domain.com/${SELECTED_PATH}"
+echo -e "  ${BOLD}分支:${NC}      ${BRANCH_NAME}"
+echo -e "  ${BOLD}Redmine:${NC}   ${SERVER}/issues/${ISSUE_ID}"
+echo ""
+
+# ─── --dry-run 模式 ────────────────────────────────────────────────────────────────
+if [[ "$MODE" == "dry-run" ]]; then
+  log_warn "dry-run 模式，以下操作不会实际执行:"
+  echo ""
+  echo "  1. POST ${JOJOGITHOOK_BASE}/newbranch?id=${SELECTED_PROJECT}&branch=${BRANCH_NAME}"
+  echo "     (在 GitLab 上创建远程分支)"
+  echo ""
+  echo "  2. git checkout -b ${BRANCH_NAME}"
+  echo "     (在本地创建并切换到新分支)"
+  echo ""
+  echo "  3. git fetch origin ${BRANCH_NAME}"
+  echo "     (拉取远程分支)"
+  echo ""
+  exit 0
+fi
+
+# ─── Step 6: 确认创建 ────────────────────────────────────────────────────────────
+if [[ "$MODE" != "local-only" ]]; then
+  read -rp "确认在 GitLab 上创建分支 ${BRANCH_NAME}? [y/N]: " CONFIRM
+  if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+    log_warn "已取消操作"
+    exit 0
+  fi
+fi
+
+# ─── Step 7: 在 GitLab 上创建远程分支 ────────────────────────────────────────────
+if [[ "$MODE" != "local-only" ]]; then
+  log_step "在 GitLab 上创建远程分支"
+
+  CREATE_RESULT=$(curl -s -X POST \
+    -H "token: ${JOJOGITHOOK_TOKEN}" \
+    "${JOJOGITHOOK_BASE}/newbranch?id=${SELECTED_PROJECT}&branch=${BRANCH_NAME}")
+
+  # 检查返回结果
+  if echo "$CREATE_RESULT" | jq -e '.info' >/dev/null 2>&1; then
+    INFO_MSG=$(echo "$CREATE_RESULT" | jq -r '.info')
+    # info 字段通常表示已有分支或其他提示
+    log_warn "GitLab 创建分支提示: ${INFO_MSG}"
+    # 如果分支已存在，继续本地操作
+  else
+    log_success "GitLab 远程分支创建成功: ${BRANCH_NAME}"
+    log_info "GitLab 分支页面: https://your-gitlab-domain.com/${SELECTED_PATH}/-/tree/${BRANCH_NAME}"
+  fi
+fi
+
+# ─── Step 8: 本地 git 操作 ────────────────────────────────────────────────────────
+log_step "本地 git 分支操作"
+
+# 检查是否在 git 仓库中
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # 检查当前分支是否有未提交的修改
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    log_warn "当前分支有未提交的修改"
+    git status --short
+    read -rp "是否暂存(stash)当前修改后继续? [y/N]: " STASH_CHOICE
+    if [[ "$STASH_CHOICE" == "y" || "$STASH_CHOICE" == "Y" ]]; then
+      git stash push -m "auto-stash before creating branch ${BRANCH_NAME}"
+      log_success "已暂存修改"
+      STASHED=true
+    else
+      log_error "请先提交或暂存修改后再创建分支"
+      exit 1
+    fi
+  fi
+
+  # 检查分支是否已存在
+  if git show-ref --verify --quiet refs/heads/${BRANCH_NAME}; then
+    log_warn "本地分支 ${BRANCH_NAME} 已存在"
+    read -rp "是否切换到该分支? [y/N]: " SWITCH_CHOICE
+    if [[ "$SWITCH_CHOICE" == "y" || "$SWITCH_CHOICE" == "Y" ]]; then
+      git checkout ${BRANCH_NAME}
+      log_success "已切换到分支 ${BRANCH_NAME}"
+    fi
+  else
+    # 创建并切换到新分支
+    if [[ "$MODE" != "local-only" ]]; then
+      # 先 fetch 远程分支（如果刚在 GitLab 创建了）
+      git fetch origin ${BRANCH_NAME} 2>/dev/null || true
+      # 基于 origin/main 或 origin/master 创建本地分支并追踪远程
+      MAIN_BRANCH=$(git branch -r | grep -E 'origin/main|origin/master' | head -1 | sed 's/^[[:space:]]*//')
+      if [[ -n "$MAIN_BRANCH" ]]; then
+        git checkout -b ${BRANCH_NAME} ${MAIN_BRANCH}
+        # 尝试设置远程追踪
+        git branch --set-upstream-to=origin/${BRANCH_NAME} ${BRANCH_NAME} 2>/dev/null || true
+        log_success "基于 ${MAIN_BRANCH} 创建本地分支 ${BRANCH_NAME}"
+      else
+        git checkout -b ${BRANCH_NAME}
+        log_success "创建本地分支 ${BRANCH_NAME}"
+      fi
+    else
+      # local-only 模式
+      MAIN_BRANCH=$(git branch -r | grep -E 'origin/main|origin/master' | head -1 | sed 's/^[[:space:]]*//')
+      if [[ -n "$MAIN_BRANCH" ]]; then
+        git checkout -b ${BRANCH_NAME} ${MAIN_BRANCH}
+        log_success "基于 ${MAIN_BRANCH} 创建本地分支 ${BRANCH_NAME} (仅本地)"
+      else
+        git checkout -b ${BRANCH_NAME}
+        log_success "创建本地分支 ${BRANCH_NAME} (仅本地)"
+      fi
+    fi
+  fi
+
+  # 如果之前 stash 了，恢复修改
+  if [[ "${STASHED:-false}" == "true" ]]; then
+    git stash pop
+    log_success "已恢复暂存的修改"
+  fi
+
+  # 推送到远程（如果不是 local-only 模式）
+  if [[ "$MODE" != "local-only" ]]; then
+    log_step "推送分支到远程"
+    read -rp "是否推送分支到远程 origin? [y/N]: " PUSH_CHOICE
+    if [[ "$PUSH_CHOICE" == "y" || "$PUSH_CHOICE" == "Y" ]]; then
+      git push -u origin ${BRANCH_NAME}
+      log_success "已推送分支 ${BRANCH_NAME} 到 origin"
+    else
+      log_info "跳过推送，可稍后手动推送: git push -u origin ${BRANCH_NAME}"
+    fi
+  fi
+else
+  log_warn "当前不在 git 仓库中"
+  log_info "远程分支已创建，请在目标项目目录中手动操作:"
+  echo "  git fetch origin"
+  echo "  git checkout -b ${BRANCH_NAME} origin/${BRANCH_NAME}"
+fi
+
+# ─── 完成 ────────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GREEN}${BOLD}✅ 工作流完成!${NC}"
+echo ""
+echo -e "  ${BOLD}分支:${NC}      ${BRANCH_NAME}"
+echo -e "  ${BOLD}需求:${NC}      ${SERVER}/issues/${ISSUE_ID}"
+echo -e "  ${BOLD}GitLab:${NC}    https://your-gitlab-domain.com/${SELECTED_PATH}/-/tree/${BRANCH_NAME}"
+echo ""
